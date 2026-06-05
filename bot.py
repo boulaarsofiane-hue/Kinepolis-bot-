@@ -213,7 +213,7 @@ async def choix_cinema(update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return ConversationHandler.END
 
-    items = [(f"🎬 {f['titre']} ({f['version']})", str(i)) for i, f in enumerate(programme)]
+    items = [(f["titre"], str(i)) for i, f in enumerate(programme)]
     await query.edit_message_text(
         f"📍 *{CINEMAS[cid]}*\n\n🎞 Choisissez un film :",
         parse_mode="Markdown",
@@ -234,11 +234,7 @@ async def choix_film(update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "film_titre": film["titre"],
         "film_version": film["version"],
     })
-    items = []
-    for i, s in enumerate(film["seances"]):
-        label = s["heure"]
-        if s.get("format"): label += f" — {s['format']}"
-        items.append((label, str(i)))
+    items = [(s["heure"], str(i)) for i, s in enumerate(film["seances"])]
 
     await query.edit_message_text(
         f"🎬 *{film['titre']}* ({film['version']})\n\n🕑 Choisissez un horaire :",
@@ -263,8 +259,10 @@ async def choix_horaire(update, context: ContextTypes.DEFAULT_TYPE) -> int:
         f"🕑 Séance : *{h}*\n\n🎟 Combien de places ?",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(str(n), callback_data=str(n)) for n in range(1, 5)],
-            [InlineKeyboardButton(str(n), callback_data=str(n)) for n in range(5, 9)],
+            [InlineKeyboardButton(str(n), callback_data=str(n)) for n in range(1, 6)],
+            [InlineKeyboardButton(str(n), callback_data=str(n)) for n in range(6, 11)],
+            [InlineKeyboardButton(str(n), callback_data=str(n)) for n in range(11, 16)],
+            [InlineKeyboardButton(str(n), callback_data=str(n)) for n in range(16, 21)],
             [InlineKeyboardButton("❌ Annuler", callback_data="annuler")],
         ]),
     )
