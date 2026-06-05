@@ -1,30 +1,23 @@
 #!/usr/bin/env python3
 """
 Bot Telegram - Prise de commande Kinépolis France
+Scraping via AlloCiné (HTML stable, pas de JS)
 """
 
 import os
 import logging
 import threading
-import asyncio
+import re
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+import requests
 from bs4 import BeautifulSoup
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ConversationHandler,
-    ContextTypes,
-    filters,
+    Application, CommandHandler, CallbackQueryHandler,
+    MessageHandler, ConversationHandler, ContextTypes, filters,
 )
 
 # ─────────────────────────────────────────────
@@ -36,156 +29,120 @@ ADMIN_ID  = 7712002106
 # ─────────────────────────────────────────────
 #  ÉTATS
 # ─────────────────────────────────────────────
-(
-    CHOIX_CINEMA,
-    CHOIX_FILM,
-    CHOIX_HORAIRE,
-    CHOIX_PLACES,
-    SAISIE_NOM,
-    SAISIE_PRENOM,
-    SAISIE_EMAIL,
-    CHOIX_PAIEMENT,
-    CONFIRMATION,
-) = range(9)
+(CHOIX_CINEMA, CHOIX_FILM, CHOIX_HORAIRE, CHOIX_PLACES,
+ SAISIE_NOM, SAISIE_PRENOM, SAISIE_EMAIL, CHOIX_PAIEMENT, CONFIRMATION) = range(9)
 
 # ─────────────────────────────────────────────
-#  CINÉMAS — code complexe officiel kinepolis.fr
+#  CINÉMAS — IDs AlloCiné officiels
 # ─────────────────────────────────────────────
 CINEMAS = {
-    "FRAMN":  "Kinépolis Amnéville",
-    "MTZAM":  "Kinépolis AMPHI – Quartier Muse",
-    "FRBLF":  "Kinépolis Belfort",
-    "FRBEZ":  "Kinépolis Béziers",
-    "KBOUR":  "Kinépolis Bourgoin-Jallieu",
-    "BRETI":  "Kinépolis Brétigny-sur-Orge",
-    "KFEN":   "Kinépolis Fenouillet (Toulouse)",
-    "KLOM":   "Kinépolis Lomme (Lille)",
-    "ULONG":  "Kinépolis Longwy",
-    "KMUL":   "Kinépolis Mulhouse",
-    "KNCY":   "Kinépolis Nancy",
-    "KNIM":   "Kinépolis Nîmes",
-    "KROU":   "Kinépolis Rouen",
-    "KSERV":  "Kinépolis Servon",
-    "KMETZ":  "Kinépolis St-Julien-lès-Metz",
-    "KTHIO":  "Kinépolis Thionville",
-    "WAVES":  "Kinépolis Waves",
+    "P0904":  "Kinépolis Amnéville",
+    "P3052":  "Kinépolis AMPHI – Quartier Muse",
+    "P1699":  "Kinépolis Belfort",
+    "P2275":  "Kinépolis Béziers",
+    "P0896":  "Kinépolis Bourgoin-Jallieu",
+    "P0929":  "Kinépolis Brétigny-sur-Orge",
+    "W3115":  "Kinépolis Fenouillet (Toulouse)",
+    "P9j0GX": "Kinépolis Lomme (Lille)",
+    "P2060":  "Kinépolis Longwy",
+    "P0774":  "Kinépolis Mulhouse",
+    "P1665":  "Kinépolis Nancy",
+    "P0923":  "Kinépolis Nîmes",
+    "P0678":  "Kinépolis Rouen",
+    "P2063":  "Kinépolis Servon",
+    "P0178":  "Kinépolis St-Julien-lès-Metz",
+    "P1795":  "Kinépolis Thionville",
+    "W5716":  "Kinépolis Waves",
 }
 
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+    "Accept-Language": "fr-FR,fr;q=0.9",
+}
 
 # ─────────────────────────────────────────────
-#  SCRAPING PLAYWRIGHT
-#  URL réelle : kinepolis.fr/kinepolis_movie_filter_now/CODE
+#  SCRAPING ALLOCINÉ
 # ─────────────────────────────────────────────
-async def scrape_avec_playwright(code: str) -> list:
+def scrape_allocine(cinema_id: str) -> list:
+    """Scrape les films et séances du jour sur AlloCiné."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    url = f"https://www.allocine.fr/seance/salle_gen_csalle={cinema_id}.html"
+    
     try:
-        from playwright.async_api import async_playwright
-    except ImportError:
-        logger.error("Playwright non installé")
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+    except Exception as e:
+        logger.warning(f"AlloCiné fetch échoué ({cinema_id}): {e}")
         return []
 
-    url = f"https://kinepolis.fr/kinepolis_movie_filter_now/{code}/"
+    soup = BeautifulSoup(resp.text, "html.parser")
     films = []
 
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-            )
-            page = await browser.new_page(
-                extra_http_headers={"Accept-Language": "fr-FR,fr;q=0.9"}
-            )
-            await page.goto(url, timeout=30000)
+    # AlloCiné structure : sections par film avec class "card entity-card"
+    for section in soup.select(".movie-card-theater, .card.entity-card, [class*='movie-card']"):
+        # Titre
+        titre_tag = section.select_one("h2 a, .meta-title a, .title a, h2.meta-title")
+        if not titre_tag:
+            titre_tag = section.select_one("h2, h3, .title")
+        if not titre_tag:
+            continue
+        titre = titre_tag.get_text(strip=True)
+        if not titre or len(titre) < 2:
+            continue
 
-            # Attendre le chargement JS
-            try:
-                await page.wait_for_selector(
-                    "article, .movie, .film, [class*='movie'], [class*='film']",
-                    timeout=12000,
-                )
-            except Exception:
-                await page.wait_for_timeout(6000)
+        # Version
+        version = "VF"
+        for tag in section.select(".version, .meta-version, [class*='version']"):
+            v = tag.get_text(strip=True)
+            if v:
+                version = v
+                break
 
-            html = await page.content()
-            await browser.close()
+        # Horaires — boutons de séances
+        seances = []
+        for btn in section.select("a.showtimes-btn, .showtimes-list a, [class*='showtime'] a, span.showtimes-time"):
+            h = btn.get_text(strip=True)
+            # Filtre : ne garder que les vraies heures (ex: "14:30", "20h15")
+            if re.match(r'^\d{1,2}[h:]\d{2}$', h):
+                seances.append({"heure": h.replace("h", ":"), "format": "", "salle": ""})
 
-        soup = BeautifulSoup(html, "html.parser")
+        # Deuxième tentative avec les spans d'horaire
+        if not seances:
+            for span in section.select("span, li"):
+                h = span.get_text(strip=True)
+                if re.match(r'^\d{1,2}[h:]\d{2}$', h):
+                    seances.append({"heure": h.replace("h", ":"), "format": "", "salle": ""})
 
-        # Parcourir tous les blocs film possibles
-        blocs = soup.select(
-            "article, .view-content > div, .movie-item, .film-item, "
-            "[class*='movie'], [class*='film-block']"
-        )
+        if titre and seances:
+            if not any(f["titre"] == titre for f in films):
+                films.append({"titre": titre, "version": version, "seances": seances})
 
-        for bloc in blocs:
-            # Titre
-            titre_tag = bloc.select_one(
-                "h2, h3, .title, .movie-title, .film-title, "
-                "[class*='title']"
-            )
-            if not titre_tag:
+    # Si rien trouvé, essai avec une structure plus large
+    if not films:
+        for h2 in soup.select("h2"):
+            titre = h2.get_text(strip=True)
+            if not titre or len(titre) < 3 or len(titre) > 100:
                 continue
-            titre = titre_tag.get_text(strip=True)
-            if not titre or len(titre) < 2 or titre.lower() in ("menu", "accueil", ""):
+            # Chercher les horaires dans le parent
+            parent = h2.find_parent()
+            if not parent:
                 continue
-
-            # Version (VF/VO/VOST)
-            version_tag = bloc.select_one(".version, .movie-version, [class*='version']")
-            version = version_tag.get_text(strip=True) if version_tag else "VF"
-
-            # Séances
             seances = []
-            for btn in bloc.select(
-                "a[class*='show'], button[class*='show'], "
-                "[class*='showtime'], [class*='seance'], [class*='session'], "
-                "a[href*='showtime'], a[href*='seance']"
-            ):
-                heure = btn.get_text(strip=True)
-                if heure and any(c.isdigit() for c in heure) and len(heure) <= 10:
-                    seances.append({
-                        "heure":  heure,
-                        "format": btn.get("data-format", ""),
-                        "salle":  btn.get("data-room", ""),
-                    })
-
-            if titre and seances:
-                # Éviter les doublons
-                if not any(f["titre"] == titre for f in films):
-                    films.append({"titre": titre, "version": version, "seances": seances})
-
-        # Fallback : chercher dans les données JSON embarquées
-        if not films:
-            import json, re
-            for script in soup.find_all("script", type=lambda t: t != "text/css"):
-                text = script.string or ""
-                for pattern in [r'"title"\s*:\s*"([^"]{3,60})"', r'"titre"\s*:\s*"([^"]{3,60})"']:
-                    for titre in re.findall(pattern, text):
-                        if titre and not any(f["titre"] == titre for f in films):
-                            films.append({
-                                "titre": titre,
-                                "version": "VF",
-                                "seances": [{"heure": "Voir site", "format": "", "salle": ""}],
-                            })
-
-    except Exception as e:
-        logger.error(f"Playwright erreur pour {code}: {e}")
+            for el in parent.find_all(string=re.compile(r'^\d{1,2}[h:]\d{2}$')):
+                h = el.strip().replace("h", ":")
+                seances.append({"heure": h, "format": "", "salle": ""})
+            if seances and not any(f["titre"] == titre for f in films):
+                films.append({"titre": titre, "version": "VF", "seances": seances})
 
     return films
 
 
-def get_programme(code: str) -> list:
+def get_programme(cinema_id: str) -> list:
     try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        result = loop.run_until_complete(scrape_avec_playwright(code))
-        loop.close()
-        return result
+        return scrape_allocine(cinema_id)
     except Exception as e:
         logger.error(f"get_programme erreur: {e}")
         return []
@@ -220,53 +177,52 @@ def format_commande(d: dict) -> str:
 # ─────────────────────────────────────────────
 #  HANDLERS
 # ─────────────────────────────────────────────
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def start(update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
-    items = [(nom, code) for code, nom in CINEMAS.items()]
+    items = [(nom, cid) for cid, nom in CINEMAS.items()]
     await update.message.reply_text(
-        "👋 Bienvenue sur le *Bot de réservation Kinépolis* !\n\n"
-        "➡️ Choisissez votre cinéma :",
+        "👋 Bienvenue sur le *Bot de réservation Kinépolis* !\n\n➡️ Choisissez votre cinéma :",
         parse_mode="Markdown",
         reply_markup=keyboard_from_list(items, cols=1),
     )
     return CHOIX_CINEMA
 
 
-async def choix_cinema(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def choix_cinema(update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     if query.data == "annuler":
         return await annuler(update, context)
 
-    code = query.data
-    context.user_data["cinema_code"] = code
-    context.user_data["cinema_nom"]  = CINEMAS[code]
+    cid = query.data
+    context.user_data["cinema_id"]  = cid
+    context.user_data["cinema_nom"] = CINEMAS[cid]
 
     await query.edit_message_text(
-        f"📍 *{CINEMAS[code]}* sélectionné.\n\n⏳ Récupération du programme… (15-20 sec)",
+        f"📍 *{CINEMAS[cid]}* sélectionné.\n\n⏳ Récupération du programme…",
         parse_mode="Markdown",
     )
 
-    programme = await asyncio.get_event_loop().run_in_executor(None, get_programme, code)
+    import asyncio
+    programme = await asyncio.get_event_loop().run_in_executor(None, get_programme, cid)
     context.user_data["programme"] = programme
 
     if not programme:
         await query.edit_message_text(
-            "⚠️ Programme indisponible pour ce cinéma.\n"
-            "Tapez /start pour choisir un autre cinéma."
+            "⚠️ Programme indisponible pour ce cinéma.\nTapez /start pour en choisir un autre."
         )
         return ConversationHandler.END
 
     items = [(f"🎬 {f['titre']} ({f['version']})", str(i)) for i, f in enumerate(programme)]
     await query.edit_message_text(
-        f"📍 *{CINEMAS[code]}*\n\n🎞 Choisissez un film :",
+        f"📍 *{CINEMAS[cid]}*\n\n🎞 Choisissez un film :",
         parse_mode="Markdown",
         reply_markup=keyboard_from_list(items, cols=1),
     )
     return CHOIX_FILM
 
 
-async def choix_film(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def choix_film(update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     if query.data == "annuler":
@@ -274,37 +230,33 @@ async def choix_film(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     film = context.user_data["programme"][int(query.data)]
     context.user_data.update({
-        "film_idx":     int(query.data),
-        "film_titre":   film["titre"],
+        "film_idx": int(query.data),
+        "film_titre": film["titre"],
         "film_version": film["version"],
     })
-
     items = []
     for i, s in enumerate(film["seances"]):
         label = s["heure"]
         if s.get("format"): label += f" — {s['format']}"
-        if s.get("salle"):  label += f" (salle {s['salle']})"
         items.append((label, str(i)))
 
     await query.edit_message_text(
         f"🎬 *{film['titre']}* ({film['version']})\n\n🕑 Choisissez un horaire :",
         parse_mode="Markdown",
-        reply_markup=keyboard_from_list(items, cols=2),
+        reply_markup=keyboard_from_list(items, cols=3),
     )
     return CHOIX_HORAIRE
 
 
-async def choix_horaire(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def choix_horaire(update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     if query.data == "annuler":
         return await annuler(update, context)
 
-    film   = context.user_data["programme"][context.user_data["film_idx"]]
+    film = context.user_data["programme"][context.user_data["film_idx"]]
     seance = film["seances"][int(query.data)]
     h = seance["heure"]
-    if seance.get("format"): h += f" — {seance['format']}"
-    if seance.get("salle"):  h += f" (salle {seance['salle']})"
     context.user_data["horaire"] = h
 
     await query.edit_message_text(
@@ -319,46 +271,41 @@ async def choix_horaire(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return CHOIX_PLACES
 
 
-async def choix_places(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def choix_places(update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     if query.data == "annuler":
         return await annuler(update, context)
-
     context.user_data["nb_places"] = int(query.data)
     await query.edit_message_text(
-        f"🎟 *{query.data} place(s)*.\n\n👤 Votre **nom** :",
-        parse_mode="Markdown",
+        f"🎟 *{query.data} place(s)*.\n\n👤 Votre **nom** :", parse_mode="Markdown"
     )
     return SAISIE_NOM
 
 
-async def saisie_nom(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def saisie_nom(update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["nom"] = update.message.text.strip()
     await update.message.reply_text("👤 Votre **prénom** :", parse_mode="Markdown")
     return SAISIE_PRENOM
 
 
-async def saisie_prenom(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def saisie_prenom(update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["prenom"] = update.message.text.strip()
     await update.message.reply_text("📧 Votre **adresse email** :", parse_mode="Markdown")
     return SAISIE_EMAIL
 
 
-async def saisie_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def saisie_email(update, context: ContextTypes.DEFAULT_TYPE) -> int:
     email = update.message.text.strip()
     if "@" not in email or "." not in email:
         await update.message.reply_text("❌ Email invalide, réessayez :")
         return SAISIE_EMAIL
-
     context.user_data["email"] = email
     await update.message.reply_text(
         "💳 Mode de paiement :",
         reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("💳 PayPal", callback_data="PayPal"),
-                InlineKeyboardButton("⚡ Virement instantané", callback_data="Virement instantané"),
-            ],
+            [InlineKeyboardButton("💳 PayPal", callback_data="PayPal"),
+             InlineKeyboardButton("⚡ Virement instantané", callback_data="Virement instantané")],
             [InlineKeyboardButton("🍎 Apple Pay", callback_data="Apple Pay")],
             [InlineKeyboardButton("❌ Annuler", callback_data="annuler")],
         ]),
@@ -366,12 +313,11 @@ async def saisie_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     return CHOIX_PAIEMENT
 
 
-async def choix_paiement(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def choix_paiement(update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     if query.data == "annuler":
         return await annuler(update, context)
-
     context.user_data["paiement"] = query.data
     recap = format_commande(context.user_data)
     await query.edit_message_text(
@@ -379,13 +325,13 @@ async def choix_paiement(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Confirmer", callback_data="confirmer"),
-            InlineKeyboardButton("❌ Annuler",   callback_data="annuler"),
+            InlineKeyboardButton("❌ Annuler", callback_data="annuler"),
         ]]),
     )
     return CONFIRMATION
 
 
-async def confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def confirmation(update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     if query.data == "annuler":
@@ -397,22 +343,16 @@ async def confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         f"\n📬 *Commande de :* [{user.full_name}](tg://user?id={user.id})\n"
         f"  @{user.username or 'sans pseudo'} | ID: `{user.id}`"
     )
-
     try:
-        await context.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=f"🆕 NOUVELLE COMMANDE\n\n{recap}",
-            parse_mode="Markdown",
-        )
+        await context.bot.send_message(chat_id=ADMIN_ID, text=f"🆕 NOUVELLE COMMANDE\n\n{recap}", parse_mode="Markdown")
     except Exception as e:
         logger.error(f"Envoi admin échoué : {e}")
 
     instrs = {
-        "PayPal":              "💳 Vous recevrez un lien PayPal par email.",
+        "PayPal": "💳 Vous recevrez un lien PayPal par email.",
         "Virement instantané": "⚡ Les coordonnées bancaires vous seront envoyées par email.",
-        "Apple Pay":           "🍎 Un lien Apple Pay vous sera envoyé par email.",
+        "Apple Pay": "🍎 Un lien Apple Pay vous sera envoyé par email.",
     }
-
     await query.edit_message_text(
         f"✅ *Commande enregistrée !*\n\n"
         f"Merci *{context.user_data.get('prenom')} {context.user_data.get('nom')}* !\n\n"
@@ -424,7 +364,7 @@ async def confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     return ConversationHandler.END
 
 
-async def annuler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def annuler(update, context: ContextTypes.DEFAULT_TYPE) -> int:
     msg = "❌ Commande annulée. Tapez /start pour recommencer."
     if update.callback_query:
         await update.callback_query.edit_message_text(msg)
@@ -434,12 +374,9 @@ async def annuler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
-async def aide(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def aide(update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "🎬 *Bot Kinépolis*\n\n"
-        "/start — Nouvelle commande\n"
-        "/annuler — Annuler la commande en cours\n"
-        "/aide — Ce message",
+        "🎬 *Bot Kinépolis*\n\n/start — Nouvelle commande\n/annuler — Annuler\n/aide — Ce message",
         parse_mode="Markdown",
     )
 
@@ -452,14 +389,11 @@ class PingHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"OK")
-    def log_message(self, *args):
-        pass
-
+    def log_message(self, *args): pass
 
 def run_web():
     port = int(os.environ.get("PORT", 8080))
     HTTPServer(("0.0.0.0", port), PingHandler).serve_forever()
-
 
 # ─────────────────────────────────────────────
 #  MAIN
@@ -469,7 +403,6 @@ def main() -> None:
     logger.info("Serveur web démarré")
 
     app = Application.builder().token(BOT_TOKEN).build()
-
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -486,14 +419,11 @@ def main() -> None:
         fallbacks=[CommandHandler("annuler", annuler)],
         allow_reentry=True,
     )
-
     app.add_handler(conv)
     app.add_handler(CommandHandler("aide", aide))
     app.add_handler(CommandHandler("help", aide))
-
     logger.info("Bot démarré — en attente de messages…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()
