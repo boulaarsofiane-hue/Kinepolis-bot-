@@ -6,17 +6,16 @@ Bot Telegram - Prise de commande Kinépolis France
 import os
 import logging
 import threading
+import asyncio
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-import requests
 from bs4 import BeautifulSoup
 
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    ReplyKeyboardRemove,
 )
 from telegram.ext import (
     Application,
@@ -50,23 +49,26 @@ ADMIN_ID  = 7712002106
 ) = range(9)
 
 # ─────────────────────────────────────────────
-#  CINÉMAS
+#  CINÉMAS — code complexe officiel kinepolis.fr
 # ─────────────────────────────────────────────
 CINEMAS = {
-    "kinepolis-amneville":    "Kinépolis Amnéville",
-    "kinepolis-bourgoin":     "Kinépolis Bourgoin-Jallieu",
-    "kinepolis-bretigny":     "Kinépolis Brétigny-sur-Orge",
-    "kinepolis-fenouillet":   "Kinépolis Fenouillet (Toulouse)",
-    "kinepolis-lomme":        "Kinépolis Lomme (Lille)",
-    "kinepolis-longwy":       "Kinépolis Longwy",
-    "kinepolis-metz":         "Kinépolis Metz",
-    "kinepolis-mulhouse":     "Kinépolis Mulhouse",
-    "kinepolis-nancy":        "Kinépolis Nancy",
-    "kinepolis-nimes":        "Kinépolis Nîmes",
-    "kinepolis-rouen":        "Kinépolis Rouen",
-    "kinepolis-servon":       "Kinépolis Servon",
-    "kinepolis-saint-julien": "Kinépolis Saint-Julien-lès-Metz",
-    "kinepolis-thionville":   "Kinépolis Thionville",
+    "FRAMN":  "Kinépolis Amnéville",
+    "MTZAM":  "Kinépolis AMPHI – Quartier Muse",
+    "FRBLF":  "Kinépolis Belfort",
+    "FRBEZ":  "Kinépolis Béziers",
+    "KBOUR":  "Kinépolis Bourgoin-Jallieu",
+    "BRETI":  "Kinépolis Brétigny-sur-Orge",
+    "KFEN":   "Kinépolis Fenouillet (Toulouse)",
+    "KLOM":   "Kinépolis Lomme (Lille)",
+    "ULONG":  "Kinépolis Longwy",
+    "KMUL":   "Kinépolis Mulhouse",
+    "KNCY":   "Kinépolis Nancy",
+    "KNIM":   "Kinépolis Nîmes",
+    "KROU":   "Kinépolis Rouen",
+    "KSERV":  "Kinépolis Servon",
+    "KMETZ":  "Kinépolis St-Julien-lès-Metz",
+    "KTHIO":  "Kinépolis Thionville",
+    "WAVES":  "Kinépolis Waves",
 }
 
 logging.basicConfig(
@@ -75,89 +77,118 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "fr-FR,fr;q=0.9",
-}
 
 # ─────────────────────────────────────────────
-#  SCRAPING
+#  SCRAPING PLAYWRIGHT
+#  URL réelle : kinepolis.fr/kinepolis_movie_filter_now/CODE
 # ─────────────────────────────────────────────
-def scrape_programme(cinema_slug: str) -> list:
-    url = f"https://kinepolis.fr/cinemas/{cinema_slug}/programme/"
+async def scrape_avec_playwright(code: str) -> list:
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=10)
-        resp.raise_for_status()
-    except Exception as e:
-        logger.warning(f"Scraping échoué pour {cinema_slug}: {e}")
+        from playwright.async_api import async_playwright
+    except ImportError:
+        logger.error("Playwright non installé")
         return []
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    url = f"https://kinepolis.fr/kinepolis_movie_filter_now/{code}/"
     films = []
 
-    for bloc in soup.select(".schedule-item, .movie-schedule, article.movie"):
-        titre_tag = bloc.select_one(".movie-title, h2.title, .schedule-title")
-        if not titre_tag:
-            continue
-        titre = titre_tag.get_text(strip=True)
-        version_tag = bloc.select_one(".version, .movie-version")
-        version = version_tag.get_text(strip=True) if version_tag else "VF"
-        seances = []
-        for btn in bloc.select("a.showtime, button.showtime, .showtime-btn, .session"):
-            heure = btn.get_text(strip=True)
-            if heure:
-                seances.append({
-                    "heure": heure,
-                    "format": btn.get("data-format", ""),
-                    "salle": btn.get("data-room", ""),
-                })
-        if titre and seances:
-            films.append({"titre": titre, "version": version, "seances": seances})
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+            )
+            page = await browser.new_page(
+                extra_http_headers={"Accept-Language": "fr-FR,fr;q=0.9"}
+            )
+            await page.goto(url, timeout=30000)
+
+            # Attendre le chargement JS
+            try:
+                await page.wait_for_selector(
+                    "article, .movie, .film, [class*='movie'], [class*='film']",
+                    timeout=12000,
+                )
+            except Exception:
+                await page.wait_for_timeout(6000)
+
+            html = await page.content()
+            await browser.close()
+
+        soup = BeautifulSoup(html, "html.parser")
+
+        # Parcourir tous les blocs film possibles
+        blocs = soup.select(
+            "article, .view-content > div, .movie-item, .film-item, "
+            "[class*='movie'], [class*='film-block']"
+        )
+
+        for bloc in blocs:
+            # Titre
+            titre_tag = bloc.select_one(
+                "h2, h3, .title, .movie-title, .film-title, "
+                "[class*='title']"
+            )
+            if not titre_tag:
+                continue
+            titre = titre_tag.get_text(strip=True)
+            if not titre or len(titre) < 2 or titre.lower() in ("menu", "accueil", ""):
+                continue
+
+            # Version (VF/VO/VOST)
+            version_tag = bloc.select_one(".version, .movie-version, [class*='version']")
+            version = version_tag.get_text(strip=True) if version_tag else "VF"
+
+            # Séances
+            seances = []
+            for btn in bloc.select(
+                "a[class*='show'], button[class*='show'], "
+                "[class*='showtime'], [class*='seance'], [class*='session'], "
+                "a[href*='showtime'], a[href*='seance']"
+            ):
+                heure = btn.get_text(strip=True)
+                if heure and any(c.isdigit() for c in heure) and len(heure) <= 10:
+                    seances.append({
+                        "heure":  heure,
+                        "format": btn.get("data-format", ""),
+                        "salle":  btn.get("data-room", ""),
+                    })
+
+            if titre and seances:
+                # Éviter les doublons
+                if not any(f["titre"] == titre for f in films):
+                    films.append({"titre": titre, "version": version, "seances": seances})
+
+        # Fallback : chercher dans les données JSON embarquées
+        if not films:
+            import json, re
+            for script in soup.find_all("script", type=lambda t: t != "text/css"):
+                text = script.string or ""
+                for pattern in [r'"title"\s*:\s*"([^"]{3,60})"', r'"titre"\s*:\s*"([^"]{3,60})"']:
+                    for titre in re.findall(pattern, text):
+                        if titre and not any(f["titre"] == titre for f in films):
+                            films.append({
+                                "titre": titre,
+                                "version": "VF",
+                                "seances": [{"heure": "Voir site", "format": "", "salle": ""}],
+                            })
+
+    except Exception as e:
+        logger.error(f"Playwright erreur pour {code}: {e}")
 
     return films
 
 
-def get_programme_fallback(cinema_slug: str) -> list:
+def get_programme(code: str) -> list:
     try:
-        resp = requests.get(
-            f"https://kinepolis.fr/api/cinemas/{cinema_slug}/program",
-            headers=HEADERS, timeout=10
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            films = []
-            for item in data.get("movies", data.get("films", [])):
-                titre = item.get("title", item.get("titre", "?"))
-                seances = []
-                for s in item.get("showtimes", item.get("seances", [])):
-                    heure = s.get("time", s.get("heure", ""))
-                    if heure:
-                        seances.append({
-                            "heure": heure,
-                            "format": s.get("format", ""),
-                            "salle": s.get("room", ""),
-                        })
-                if seances:
-                    films.append({
-                        "titre": titre,
-                        "version": item.get("version", "VF"),
-                        "seances": seances,
-                    })
-            return films
-    except Exception:
-        pass
-    return []
-
-
-def get_programme(cinema_slug: str) -> list:
-    prog = scrape_programme(cinema_slug)
-    if not prog:
-        prog = get_programme_fallback(cinema_slug)
-    return prog
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        result = loop.run_until_complete(scrape_avec_playwright(code))
+        loop.close()
+        return result
+    except Exception as e:
+        logger.error(f"get_programme erreur: {e}")
+        return []
 
 
 # ─────────────────────────────────────────────
@@ -191,10 +222,9 @@ def format_commande(d: dict) -> str:
 # ─────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
-    items = [(nom, slug) for slug, nom in CINEMAS.items()]
+    items = [(nom, code) for code, nom in CINEMAS.items()]
     await update.message.reply_text(
         "👋 Bienvenue sur le *Bot de réservation Kinépolis* !\n\n"
-        "Je vais vous guider pour commander vos places en quelques étapes.\n\n"
         "➡️ Choisissez votre cinéma :",
         parse_mode="Markdown",
         reply_markup=keyboard_from_list(items, cols=1),
@@ -208,28 +238,28 @@ async def choix_cinema(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     if query.data == "annuler":
         return await annuler(update, context)
 
-    slug = query.data
-    context.user_data["cinema_slug"] = slug
-    context.user_data["cinema_nom"]  = CINEMAS[slug]
+    code = query.data
+    context.user_data["cinema_code"] = code
+    context.user_data["cinema_nom"]  = CINEMAS[code]
 
     await query.edit_message_text(
-        f"📍 *{CINEMAS[slug]}* sélectionné.\n\n⏳ Récupération du programme…",
+        f"📍 *{CINEMAS[code]}* sélectionné.\n\n⏳ Récupération du programme… (15-20 sec)",
         parse_mode="Markdown",
     )
 
-    programme = get_programme(slug)
+    programme = await asyncio.get_event_loop().run_in_executor(None, get_programme, code)
     context.user_data["programme"] = programme
 
     if not programme:
         await query.edit_message_text(
-            "⚠️ Programme indisponible pour ce cinéma (site JS).\n"
+            "⚠️ Programme indisponible pour ce cinéma.\n"
             "Tapez /start pour choisir un autre cinéma."
         )
         return ConversationHandler.END
 
     items = [(f"🎬 {f['titre']} ({f['version']})", str(i)) for i, f in enumerate(programme)]
     await query.edit_message_text(
-        f"📍 *{CINEMAS[slug]}*\n\n🎞 Choisissez un film :",
+        f"📍 *{CINEMAS[code]}*\n\n🎞 Choisissez un film :",
         parse_mode="Markdown",
         reply_markup=keyboard_from_list(items, cols=1),
     )
@@ -297,7 +327,7 @@ async def choix_places(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
     context.user_data["nb_places"] = int(query.data)
     await query.edit_message_text(
-        f"🎟 *{query.data} place(s)* sélectionnée(s).\n\n👤 Votre **nom** :",
+        f"🎟 *{query.data} place(s)*.\n\n👤 Votre **nom** :",
         parse_mode="Markdown",
     )
     return SAISIE_NOM
@@ -377,17 +407,16 @@ async def confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     except Exception as e:
         logger.error(f"Envoi admin échoué : {e}")
 
-    paiement = context.user_data.get("paiement", "")
     instrs = {
-        "PayPal":               "💳 Vous recevrez un lien PayPal par email.",
-        "Virement instantané":  "⚡ Les coordonnées bancaires vous seront envoyées par email.",
-        "Apple Pay":            "🍎 Un lien Apple Pay vous sera envoyé par email.",
+        "PayPal":              "💳 Vous recevrez un lien PayPal par email.",
+        "Virement instantané": "⚡ Les coordonnées bancaires vous seront envoyées par email.",
+        "Apple Pay":           "🍎 Un lien Apple Pay vous sera envoyé par email.",
     }
 
     await query.edit_message_text(
         f"✅ *Commande enregistrée !*\n\n"
         f"Merci *{context.user_data.get('prenom')} {context.user_data.get('nom')}* !\n\n"
-        f"{instrs.get(paiement, '')}\n\n"
+        f"{instrs.get(context.user_data.get('paiement',''), '')}\n\n"
         "_Pour une nouvelle commande, tapez /start_",
         parse_mode="Markdown",
     )
